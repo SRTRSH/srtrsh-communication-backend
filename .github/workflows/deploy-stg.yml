@@ -1,0 +1,112 @@
+name: Deploy Communication Backend to STG
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    name: Run Unit and Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: srtrsh
+          POSTGRES_PASSWORD: srtrsh_dev
+          POSTGRES_DB: srtrsh
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install . pytest pytest-asyncio anyio
+
+      - name: Initialize test schema with dbmate
+        uses: SRTRSH/srtrsh-infrastructure@main
+        with:
+          local_database_url: 'postgres://srtrsh:srtrsh_dev@localhost:5433/srtrsh?sslmode=disable'
+
+      - name: Run test suite
+        run: |
+          pytest -v
+
+  migrate:
+    name: Run STG Database Migrations
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Run canonical STG migrations
+        uses: SRTRSH/srtrsh-infrastructure@main
+
+  deploy:
+    name: Build, Push and Deploy to Cloud Run
+    needs: [migrate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via WIF
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/749422959593/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
+          service_account: sa-github-actions-stg@srtrsh-stg.iam.gserviceaccount.com
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Authenticate Docker to Artifact Registry
+        run: |
+          gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t europe-west1-docker.pkg.dev/srtrsh-stg/srtrsh-docker/srtrsh-communication-backend:${{ github.sha }} \
+            -t europe-west1-docker.pkg.dev/srtrsh-stg/srtrsh-docker/srtrsh-communication-backend:stg-latest \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push europe-west1-docker.pkg.dev/srtrsh-stg/srtrsh-docker/srtrsh-communication-backend:${{ github.sha }}
+          docker push europe-west1-docker.pkg.dev/srtrsh-stg/srtrsh-docker/srtrsh-communication-backend:stg-latest
+
+      - name: Deploy immutable image to Cloud Run
+        run: |
+          gcloud run deploy srtrsh-communication-backend \
+            --project=srtrsh-stg \
+            --region=europe-west1 \
+            --image=europe-west1-docker.pkg.dev/srtrsh-stg/srtrsh-docker/srtrsh-communication-backend:${{ github.sha }}
+
+      - name: Verify Cloud Run deployment
+        run: |
+          REVISION=$(gcloud run services describe srtrsh-communication-backend --project=srtrsh-stg --region=europe-west1 --format="value(status.latestReadyRevisionName)")
+          echo "Deployed and verified active revision: $REVISION"
+          SERVICE_URL=$(gcloud run services describe srtrsh-communication-backend --project=srtrsh-stg --region=europe-west1 --format="value(status.url)")
+          echo "Service URL: $SERVICE_URL"
+          curl -f -s -S "$SERVICE_URL/health"
